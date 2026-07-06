@@ -1,0 +1,176 @@
+import os
+import sys
+import logging
+import re
+import subprocess
+import time
+from dotenv import load_dotenv
+from github import Github
+import google.generativeai as genai
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+def load_config():
+    load_dotenv()
+    required_vars = ["GITHUB_TOKEN", "GEMINI_API_KEY", "GITHUB_REPO", "ISSUE_NUMBER"]
+    config = {var: os.getenv(var) for var in required_vars}
+    missing = [var for var, val in config.items() if not val]
+
+    if missing:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+
+    config["GEMINI_MODEL"] = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+    return config
+
+def fetch_github_issue(repo, issue_number):
+    logging.info(f"Fetching issue #{issue_number} from {repo.full_name}...")
+    issue = repo.get_issue(int(issue_number))
+    return {"title": issue.title, "body": issue.body}
+
+def get_codebase_context(max_size_kb=50):
+    logging.info("Gathering codebase context...")
+    ignored_dirs = {'.git', '.venv', '__pycache__', '.agent-output', 'node_modules', '.claude'}
+    context = []
+
+    for root, dirs, files in os.walk('.'):
+        dirs[:] = [d for d in dirs if d not in ignored_dirs]
+        for file in files:
+            filepath = os.path.join(root, file)
+            # Skip large files
+            if os.path.getsize(filepath) > max_size_kb * 1024:
+                continue
+
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    chunk = f.read(1024)
+                    if '\0' in chunk:
+                        continue
+                    content = chunk + f.read()
+                    clean_path = os.path.relpath(filepath, '.')
+                    context.append(f"--- {clean_path} ---\n{content}\n")
+            except (OSError, UnicodeDecodeError):
+                pass # Ignore unreadable files
+
+    return "\n".join(context)
+
+def run_gemini_chain(model_name, issue_data, context):
+    model = genai.GenerativeModel(model_name)
+    chat = model.start_chat()
+
+    ticket_text = f"Title: {issue_data['title']}\nBody: {issue_data['body']}"
+
+    def run_step(step_name, prompt):
+        logging.info(f"Running Step: {step_name}...")
+        return chat.send_message(prompt).text
+
+    # Step 1: Estimation
+    est_prompt = f"Codebase Context:\n{context}\n\nEstimate the complexity of this ticket. Explain your reasoning.\n\nTicket:\n{ticket_text}"
+    run_step("1: Estimation", est_prompt)
+
+    # Step 2: Planning
+    plan_prompt = "Create an implementation plan for this ticket based on the estimation and codebase context."
+    run_step("2: Planning", plan_prompt)
+
+    # Step 3: PR Generation
+    pr_prompt = """Generate the code changes required to implement the plan.
+Output the full content for any file you modify or create.
+You MUST wrap each file's output EXACTLY like this:
+==== FILE: path/to/file.py ====
+<file contents here>
+==== ENDFILE ===="""
+    return run_step("3: PR Generation", pr_prompt)
+
+def apply_changes(ai_output):
+    logging.info("Parsing AI output and applying changes locally...")
+    pattern = r"==== FILE:\s*(.*?)\s*====\n(.*?)\n==== ENDFILE ===="
+    matches = re.finditer(pattern, ai_output, re.DOTALL)
+
+    applied_files = []
+    for match in matches:
+        filepath = match.group(1).strip()
+        content = match.group(2)
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        logging.info(f"Updated {filepath}")
+        applied_files.append(filepath)
+
+    if not applied_files:
+        logging.warning("No files matched the expected output format.")
+
+    return applied_files
+
+def run_git_command(cmd):
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        cmd_str = cmd if isinstance(cmd, str) else ' '.join(cmd)
+        raise RuntimeError(f"Git command failed: {cmd_str}\nError: {e.stderr}")
+
+def create_git_branch_and_push(issue_number, changed_files):
+    branch_name = f"gemini-issue-{issue_number}-{int(time.time())}"
+    logging.info(f"Creating and checking out branch: {branch_name}")
+    run_git_command(["git", "checkout", "-b", branch_name])
+
+    logging.info("Committing changes...")
+    run_git_command(["git", "add", "--"] + changed_files)
+    run_git_command(["git", "commit", "-m", f"Automated implementation for issue #{issue_number}"])
+
+    logging.info("Pushing to remote...")
+    run_git_command(["git", "push", "-u", "origin", branch_name])
+
+    return branch_name
+
+def create_github_pr(repo, branch_name, issue_data, issue_number):
+    logging.info("Creating Pull Request...")
+    pr_title = f"Fix: {issue_data['title']}"
+    pr_body = f"Automated PR generated by Gemini workflow.\n\nCloses #{issue_number}"
+
+    pr = repo.create_pull(
+        title=pr_title,
+        body=pr_body,
+        head=branch_name,
+        base=repo.default_branch
+    )
+    logging.info(f"Successfully created PR: {pr.html_url}")
+    return pr.html_url
+
+def main():
+    try:
+        config = load_config()
+
+        genai.configure(api_key=config["GEMINI_API_KEY"])
+        gh = Github(config["GITHUB_TOKEN"])
+        repo = gh.get_repo(config["GITHUB_REPO"])
+
+        # 1. Fetch Issue
+        issue_data = fetch_github_issue(repo, config["ISSUE_NUMBER"])
+
+        # 2. Get Context
+        context = get_codebase_context()
+
+        # 3. Run Gemini Chain
+        ai_output = run_gemini_chain(config["GEMINI_MODEL"], issue_data, context)
+
+        # 4. Apply Changes locally
+        applied_files = apply_changes(ai_output)
+        if not applied_files:
+            raise RuntimeError("No files applied. Exiting before git operations.")
+
+        # 5. Git commit and push
+        branch_name = create_git_branch_and_push(config["ISSUE_NUMBER"], applied_files)
+
+        # 6. Open PR
+        pr_url = create_github_pr(repo, branch_name, issue_data, config["ISSUE_NUMBER"])
+
+        logging.info(f"Workflow completed successfully! PR URL: {pr_url}")
+    except Exception as e:
+        logging.error(str(e))
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
