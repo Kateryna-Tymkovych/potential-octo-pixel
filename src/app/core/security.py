@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Union
 
@@ -23,11 +24,14 @@ def create_token(
     subject: Union[str, Any], expires_delta: timedelta, token_type: str
 ) -> str:
     """Internal helper to create a JWT token."""
-    expire = datetime.now(timezone.utc) + expires_delta
+    now = datetime.now(timezone.utc)
+    expire = now + expires_delta
     to_encode = {
         "exp": expire,
+        "iat": now,
         "sub": str(subject),
         "type": token_type,
+        "jti": str(uuid.uuid4()),
     }
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
