@@ -1,0 +1,17 @@
+# MANUAL TEST CASE
+
+Summary:
+[Objective]
+
+Pre-conditions:
+- [Starting state]
+
+Environment:
+- [Platform/Version/Data]
+
+Steps:
+1. [Action]
+2. [Action]
+
+Expected Result:
+[Success criteria]
