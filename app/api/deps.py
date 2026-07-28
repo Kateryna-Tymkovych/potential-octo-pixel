@@ -20,14 +20,18 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = decode_token(token)
-        user_id = payload.get("sub")
-        if user_id is None:
+        payload = decode_token(token, expected_type="access")
+        user_id_str = payload.get("sub")
+        if user_id_str is None:
             raise credentials_exception
+        user_id = int(user_id_str)
+    except (ValueError, TypeError):
+        raise credentials_exception
     except Exception:
+        # Re-raise credentials_exception for any token decoding/validation errors
         raise credentials_exception
 
-    user = await db.get(User, int(user_id))
+    user = await db.get(User, user_id)
     if user is None:
         raise credentials_exception
     return user

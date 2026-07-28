@@ -14,6 +14,8 @@ from app.core.security import (
 )
 from app.core.config import settings
 
+AUTH_COOKIE_PATH = "/api/v1/auth"
+
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> User | None:
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
@@ -75,22 +77,42 @@ async def rotate_refresh_token(db: AsyncSession, response: Response, refresh_tok
     )
     db_token = result.scalar_one_or_none()
 
-    if not db_token or db_token.revoked or db_token.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+    if not db_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired refresh token",
+            detail="Invalid refresh token",
+        )
+
+    if db_token.revoked:
+        # Potential reuse attack: revoke all tokens for this user
+        from sqlalchemy import update
+        await db.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == db_token.user_id)
+            .values(revoked=True)
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token reuse detected",
+        )
+
+    if db_token.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Expired refresh token",
         )
 
     # Decode to get user_id
     try:
-        payload = decode_token(refresh_token)
+        payload = decode_token(refresh_token, expected_type="refresh")
         user_id = payload.get("sub")
         if not user_id:
             raise ValueError("No sub in token")
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token",
+            detail="Malformed refresh token",
         )
 
     # Rotate: Revoke old token
@@ -109,7 +131,7 @@ async def revoke_refresh_token(db: AsyncSession, response: Response, refresh_tok
             db_token.revoked = True
             await db.commit()
 
-    response.delete_cookie(key="refresh_token", path="/api/v1/auth/refresh")
+    response.delete_cookie(key="refresh_token", path=AUTH_COOKIE_PATH)
 
 def _set_refresh_cookie(response: Response, refresh_token: str):
     response.set_cookie(
@@ -119,5 +141,5 @@ def _set_refresh_cookie(response: Response, refresh_token: str):
         secure=True,
         samesite="lax",
         max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
-        path="/api/v1/auth/refresh",
+        path=AUTH_COOKIE_PATH,
     )
